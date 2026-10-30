@@ -53,6 +53,8 @@ CREATE TABLE "BrowserProfile" (
     "id" UUID NOT NULL DEFAULT gen_random_uuid(),
     "ownerId" UUID NOT NULL,
     "name" TEXT NOT NULL,
+    "description" TEXT,
+    "browser" TEXT NOT NULL DEFAULT 'chromium',
     "timezone" TEXT NOT NULL DEFAULT 'UTC',
     "locale" TEXT NOT NULL DEFAULT 'en-US',
     "userAgent" TEXT,
@@ -117,7 +119,6 @@ CREATE TABLE "Invitation" (
     "senderId" UUID NOT NULL,
     "recipientId" UUID,
     "invitedEmail" TEXT NOT NULL,
-    "tokenHash" TEXT,
     "permission" "SharePermission" NOT NULL DEFAULT 'VIEW_ONLY',
     "tokenHash" TEXT NOT NULL,
     "status" "InvitationStatus" NOT NULL DEFAULT 'PENDING',
@@ -210,3 +211,12 @@ CREATE TABLE "SecurityEvents" (
 CREATE INDEX "SecurityEvents_userId_idx" ON "SecurityEvents"("userId");
 CREATE INDEX "SecurityEvents_type_idx" ON "SecurityEvents"("type");
 CREATE INDEX "SecurityEvents_createdAt_idx" ON "SecurityEvents"("createdAt");
+
+-- HostEndpoint (single-row table; the row id is always the fixed string "pc-host")
+CREATE TABLE "HostEndpoint" (
+    "id" TEXT NOT NULL,
+    "url" TEXT NOT NULL,
+    "prevEnd" TEXT,
+    "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT "HostEndpoint_pkey" PRIMARY KEY ("id")
+);
