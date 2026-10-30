@@ -1,0 +1,304 @@
+// Secure Cloud Browser & Account Sharing Platform — Prisma schema
+// Implements ALL tables from UPDATED_PROMPT_v2.md Part B section 11.
+// Rules enforced here / in app code:
+//  - All ids are UUIDv4 (unguessable; an id alone grants nothing — every
+//    request is authorized on the backend).
+//  - NO plaintext secrets anywhere: password is an Argon2id/bcrypt hash,
+//    every token column stores a SHA-256 HASH only.
+//  - AuditLog is APPEND-ONLY: the application database role must be granted
+//    INSERT + SELECT only on "AuditLog" (no UPDATE / DELETE). Enforced at
+//    the database-grant level in production, documented in README.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  // Supabase (free stack, docs/FREE_STACK.md) IS PostgreSQL, so no provider
+  // change is needed. Following Prisma + Supabase documented practice:
+  //  - DATABASE_URL = the POOLED (PgBouncer) Supabase connection, used by the
+  //    app at runtime (serverless on Vercel); keep "?pgbouncer=true" on it.
+  //  - DIRECT_URL (directUrl below) = the DIRECT Supabase connection, used by
+  //    `prisma migrate` — migrations must not run through PgBouncer.
+  //  - relationMode is deliberately LEFT at the default ("foreignKeys"):
+  //    Supabase is a full PostgreSQL and enforces real foreign keys, unlike
+  //    serverless MySQL offerings where relationMode = "prisma" is required.
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+enum Role {
+  USER
+  ADMIN // Manages platform/support. Gets NO automatic access to private browser sessions.
+}
+
+enum BrowserSessionStatus {
+  STARTING
+  RUNNING
+  STOPPED
+  ERROR
+}
+
+enum SharePermission {
+  VIEW_ONLY // No input, no clipboard, no downloads (enforced at stream layer).
+  INTERACTIVE // Input allowed; downloads/uploads off unless owner enables them.
+}
+
+enum InvitationStatus {
+  PENDING
+  ACCEPTED
+  DECLINED
+  EXPIRED
+  REVOKED
+}
+
+enum SecurityEventType {
+  LOGIN_SUCCESS
+  LOGIN_FAILURE
+  LOGIN_LOCKED
+  PASSWORD_CHANGED
+  PASSWORD_RESET_REQUESTED
+  TWO_FACTOR_ENABLED
+  TWO_FACTOR_DISABLED
+  SESSION_REVOKED
+  SHARE_CREATED
+  SHARE_REVOKED
+  PROFILE_DELETED
+}
+
+model User {
+  id              String    @id @default(uuid()) @db.Uuid
+  email           String    @unique
+  passwordHash    String // Argon2id (preferred) or bcrypt >= 12. Never plaintext.
+  displayName     String?
+  role            Role      @default(USER)
+  emailVerifiedAt DateTime?
+  // TOTP 2FA (Phase 1 remaining: enrollment flow). Secret must be encrypted at rest.
+  totpSecretEncrypted String?
+  twoFactorEnabled    Boolean @default(false)
+  // Login lockout backoff (v2 section 5)
+  failedLoginCount Int       @default(0)
+  lockedUntil      DateTime?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+  deletedAt        DateTime? // soft-delete marker; hard delete cascades below
+
+  sessions              UserSession[]
+  profiles              BrowserProfile[]        @relation("ProfileOwner")
+  sharesGranted         ProfileShare[]          @relation("ShareOwner")
+  sharesReceived        ProfileShare[]          @relation("ShareRecipient")
+  invitationsSent       Invitation[]            @relation("InvitationSender")
+  invitationsReceived   Invitation[]            @relation("InvitationRecipient")
+  accessPermissions     AccessPermission[]
+  auditLogs             AuditLog[]              @relation("AuditActor")
+  passwordResetTokens   PasswordResetToken[]
+  emailVerifyTokens     EmailVerificationToken[]
+  securityEvents        SecurityEvents[]
+
+  @@index([email])
+}
+
+model UserSession {
+  id           String    @id @default(uuid()) @db.Uuid
+  userId       String    @db.Uuid
+  user         User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash    String    @unique // SHA-256 hash of the session token ONLY. Raw token lives only in the HttpOnly cookie.
+  userAgent    String?
+  ipAddress    String?
+  createdAt    DateTime  @default(now())
+  expiresAt    DateTime // absolute expiry: 12h from creation (v2 Part A section 3)
+  revokedAt    DateTime?
+  lastSeenAt   DateTime  @default(now())
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+model BrowserProfile {
+  id        String @id @default(uuid()) @db.Uuid
+  ownerId   String @db.Uuid
+  owner     User   @relation("ProfileOwner", fields: [ownerId], references: [id], onDelete: Cascade)
+  name      String
+  // Optional purpose label the owner gives the profile ("ye profile kis
+  // kaam ke liye hai") — shown on the dashboard card under the name.
+  description String?
+  // Browser engine for this profile: "chromium" or "firefox" (chosen at
+  // profile creation; validated in the API, stored as a plain string).
+  browser   String @default("chromium")
+  // Consistent per-profile environment (v2 Part A section 4): keep fingerprint
+  // stable across reconnects so external sites don't flag "new device" each time.
+  timezone  String @default("UTC")
+  locale    String @default("en-US")
+  userAgent String?
+  viewportWidth  Int @default(1366)
+  viewportHeight Int @default(768)
+  // Opaque storage key for the per-profile volume (dir mode 0700). Never a public path/URL.
+  storageKey String @unique
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  sessions    BrowserSession[]
+  shares      ProfileShare[]
+  invitations Invitation[]
+  permissions AccessPermission[]
+
+  @@index([ownerId])
+}
+
+model BrowserSession {
+  id          String               @id @default(uuid()) @db.Uuid
+  profileId   String               @db.Uuid
+  profile     BrowserProfile       @relation(fields: [profileId], references: [id], onDelete: Cascade)
+  startedById String               @db.Uuid // user who launched it (owner or authorized collaborator)
+  status      BrowserSessionStatus @default(STARTING)
+  containerRef String? // internal orchestrator reference — never exposed via public API/URL
+  // Stream access: short-lived (<= 5 min), single-use token, HASH stored only.
+  streamTokenHash String?   @unique
+  streamTokenExpiresAt DateTime?
+  streamTokenUsedAt    DateTime?
+  startedAt   DateTime  @default(now())
+  stoppedAt   DateTime?
+  lastActiveAt DateTime @default(now())
+
+  @@index([profileId])
+  @@index([startedById])
+  @@index([status])
+}
+
+model ProfileShare {
+  id          String          @id @default(uuid()) @db.Uuid
+  profileId   String          @db.Uuid
+  profile     BrowserProfile  @relation(fields: [profileId], references: [id], onDelete: Cascade)
+  ownerId     String          @db.Uuid
+  owner       User            @relation("ShareOwner", fields: [ownerId], references: [id], onDelete: Cascade)
+  // Nullable: a share created as a LINK share has no recipient user yet —
+  // anyone holding the link is identified by tokenHash below, not by a row.
+  recipientId String?         @db.Uuid
+  recipient   User?           @relation("ShareRecipient", fields: [recipientId], references: [id], onDelete: SetNull)
+  // Link shares (v2): SHA-256 hash of the share-link token ONLY. The raw
+  // token is shown to the owner exactly once at creation, never stored.
+  tokenHash   String?         @unique
+  permission  SharePermission @default(VIEW_ONLY)
+  allowDownloads Boolean      @default(false)
+  createdAt   DateTime        @default(now())
+  expiresAt   DateTime? // optional expiry set by owner
+  revokedAt   DateTime? // revoke = immediate: active stream must be terminated, not just blocked at next login
+
+  @@unique([profileId, recipientId])
+  @@index([recipientId])
+  @@index([profileId])
+}
+
+model Invitation {
+  id          String           @id @default(uuid()) @db.Uuid
+  profileId   String           @db.Uuid
+  profile     BrowserProfile   @relation(fields: [profileId], references: [id], onDelete: Cascade)
+  senderId    String           @db.Uuid
+  sender      User             @relation("InvitationSender", fields: [senderId], references: [id], onDelete: Cascade)
+  recipientId String?          @db.Uuid // null when sent as an invite link to an email not yet registered
+  recipient   User?            @relation("InvitationRecipient", fields: [recipientId], references: [id], onDelete: Cascade)
+  invitedEmail String
+  permission  SharePermission  @default(VIEW_ONLY)
+  tokenHash   String           @unique // SHA-256 hash of the invite token ONLY
+  status      InvitationStatus @default(PENDING)
+  createdAt   DateTime         @default(now())
+  expiresAt   DateTime // invite links expire in 7 days (v2 Part A section 3)
+  acceptedAt  DateTime?
+
+  @@index([invitedEmail])
+  @@index([profileId])
+}
+
+// Effective permission grants (materialized from accepted shares / ownership).
+// Backend checks THIS (plus ownership) on every request and on stream-token issuance.
+model AccessPermission {
+  id            String          @id @default(uuid()) @db.Uuid
+  profileId     String          @db.Uuid
+  profile       BrowserProfile  @relation(fields: [profileId], references: [id], onDelete: Cascade)
+  userId        String          @db.Uuid
+  user          User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  permission    SharePermission
+  sourceShareId String?         @db.Uuid // ProfileShare that produced this grant, if any
+  createdAt     DateTime        @default(now())
+  expiresAt     DateTime?
+  revokedAt     DateTime?
+
+  @@unique([profileId, userId])
+  @@index([userId])
+}
+
+// APPEND-ONLY. No update/delete code paths may exist for this model, and the
+// production app DB role gets INSERT + SELECT grants only on this table.
+model AuditLog {
+  id        String   @id @default(uuid()) @db.Uuid
+  actorId   String?  @db.Uuid
+  actor     User?    @relation("AuditActor", fields: [actorId], references: [id], onDelete: SetNull)
+  action    String // e.g. auth.login, browser.launch, share.create, share.revoke, profile.delete
+  targetType String? // e.g. BrowserProfile, ProfileShare
+  targetId  String?  @db.Uuid
+  metadata  Json? // must NEVER contain passwords, cookies, or raw tokens
+  ipAddress String?
+  createdAt DateTime @default(now())
+
+  @@index([actorId])
+  @@index([action])
+  @@index([createdAt])
+}
+
+model PasswordResetToken {
+  id        String    @id @default(uuid()) @db.Uuid
+  userId    String    @db.Uuid
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash String    @unique // SHA-256 hash ONLY; raw token only in the emailed link
+  createdAt DateTime  @default(now())
+  expiresAt DateTime // 1 hour, single-use
+  usedAt    DateTime?
+
+  @@index([userId])
+}
+
+model EmailVerificationToken {
+  id        String    @id @default(uuid()) @db.Uuid
+  userId    String    @db.Uuid
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash String    @unique // SHA-256 hash ONLY
+  createdAt DateTime  @default(now())
+  expiresAt DateTime
+  usedAt    DateTime?
+
+  @@index([userId])
+}
+
+model SecurityEvents {
+  id        String            @id @default(uuid()) @db.Uuid
+  userId    String?           @db.Uuid
+  user      User?             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type      SecurityEventType
+  ipAddress String?
+  userAgent String?
+  metadata  Json? // never secrets
+  createdAt DateTime          @default(now())
+
+  @@index([userId])
+  @@index([type])
+  @@index([createdAt])
+}
+
+
+// Single-row table (the row id is always the fixed legacy string "pc-host"
+// — kept so the existing host agent keeps working unchanged): the RDP
+// host's current orchestrator base URL. The host is reached through a
+// tunnel whose URL can change on host restart, so the RDP agent POSTs a
+// heartbeat with its current URL (see /api/host/heartbeat) and the app
+// prefers a fresh heartbeated URL over the static ORCHESTRATOR_URL env var.
+model HostEndpoint {
+  id        String   @id // fixed value "pc-host" — not a uuid, there is only ever one row
+  url       String
+  // How the host's PREVIOUS run ended, as classified by the PC agent and
+  // sent with each heartbeat (v20 agent): "abrupt" (power loss / crash)
+  // or "clean" (proper shutdown). Null = unknown (older agent, or the
+  // agent has not classified a previous run yet).
+  prevEnd   String?
+  updatedAt DateTime @updatedAt
+}

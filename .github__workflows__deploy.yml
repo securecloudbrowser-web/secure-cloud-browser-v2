@@ -1,0 +1,107 @@
+# CI + free-stack deployment: GitHub Actions -> Vercel, database on Supabase.
+# See docs/FREE_STACK.md for the full free setup walkthrough.
+#
+# HONESTY RULES for this workflow:
+#  - Every check step must really pass: no continue-on-error anywhere. If
+#    install / prisma validate / typecheck / build fails, the run is RED.
+#  - The build below uses PLACEHOLDER env values only (enough for Prisma and
+#    Next.js to build; no real database is contacted during build, and no real
+#    secret is ever written into this file).
+#  - The deploy job FAILS LOUDLY if the Vercel secrets are missing. It never
+#    pretends a deployment happened.
+#
+# Required GitHub repository secrets for the deploy job
+# (Settings -> Secrets and variables -> Actions):
+#   VERCEL_TOKEN      - Vercel account token (Vercel dashboard -> Settings -> Tokens)
+#   VERCEL_ORG_ID     - from `vercel link` / .vercel/project.json of a local link
+#   VERCEL_PROJECT_ID - from `vercel link` / .vercel/project.json of a local link
+# Runtime env vars (DATABASE_URL, DIRECT_URL, Supabase keys, ...) are configured
+# in the VERCEL project's Environment Variables, not here.
+
+name: CI and Deploy (Vercel)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  # Placeholder-only values so prisma validate/generate and next build can run
+  # in CI without real credentials. These point nowhere real.
+  DATABASE_URL: "postgresql://postgres.PLACEHOLDER:PLACEHOLDER@aws-0-PLACEHOLDER.pooler.supabase.com:6543/postgres?pgbouncer=true"
+  DIRECT_URL: "postgresql://postgres.PLACEHOLDER:PLACEHOLDER@aws-0-PLACEHOLDER.pooler.supabase.com:5432/postgres"
+  NEXT_PUBLIC_SUPABASE_URL: "https://PLACEHOLDER.supabase.co"
+  NEXT_PUBLIC_SUPABASE_ANON_KEY: "PLACEHOLDER"
+  SUPABASE_SERVICE_ROLE_KEY: "PLACEHOLDER"
+  SESSION_COOKIE_NAME: "scb_session"
+  APP_URL: "http://localhost:3000"
+
+jobs:
+  check-and-build:
+    name: Install, validate, typecheck, build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      # NOTE: this repo does not have a committed package-lock.json yet, so
+      # `npm ci` cannot be used. Once a lockfile is generated and committed,
+      # switch this step to `npm ci` for reproducible installs.
+      - name: Install dependencies
+        run: npm install
+
+      - name: Validate Prisma schema (Supabase Postgres)
+        run: npx prisma validate
+
+      - name: Generate Prisma client
+        run: npx prisma generate
+
+      - name: Typecheck (must pass — no continue-on-error)
+        run: npm run typecheck
+
+      - name: Build (must pass — no continue-on-error)
+        run: npm run build
+
+  deploy:
+    name: Deploy to Vercel (production)
+    needs: check-and-build
+    # Deploy only from main, never from pull requests.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    env:
+      VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+      VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+      VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Fail loudly if Vercel secrets are missing
+        run: |
+          missing=0
+          for name in VERCEL_TOKEN VERCEL_ORG_ID VERCEL_PROJECT_ID; do
+            if [ -z "${!name}" ]; then
+              echo "::error::Required GitHub secret $name is not set. Add it under Settings -> Secrets and variables -> Actions (see docs/FREE_STACK.md). Deployment NOT attempted."
+              missing=1
+            fi
+          done
+          exit $missing
+
+      - name: Install Vercel CLI
+        run: npm install --global vercel@latest
+
+      - name: Pull Vercel environment (production)
+        run: vercel pull --yes --environment=production --token="$VERCEL_TOKEN"
+
+      - name: Build with Vercel
+        run: vercel build --prod --token="$VERCEL_TOKEN"
+
+      - name: Deploy to Vercel (production)
+        run: vercel deploy --prebuilt --prod --token="$VERCEL_TOKEN"
