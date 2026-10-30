@@ -1,0 +1,57 @@
+# Local/dev and single-server production topology (v2 Part B section 3).
+# NOT deployable to shared PHP hosting such as InfinityFree — a VPS is required.
+services:
+  app:
+    build: .
+    env_file: [.env]
+    environment:
+      DATABASE_URL: postgresql://appuser:${POSTGRES_PASSWORD:-changeme}@postgres:5432/cloudbrowser?schema=public
+      REDIS_URL: redis://redis:6379
+      ORCHESTRATOR_URL: http://orchestrator:4001
+    depends_on: [postgres, redis, orchestrator]
+    restart: unless-stopped
+    # No public port: traffic comes through the reverse proxy only.
+    expose: ["3000"]
+
+  orchestrator:
+    # INTERNAL-ONLY service that is the sole component allowed to talk to Docker.
+    # The web app never receives the Docker socket (v2 Part A section 6).
+    # Implementation is an outline in Phase 1 — see src/lib/browser/orchestrator.ts.
+    image: node:22-alpine
+    command: ["node", "-e", "console.log('orchestrator placeholder — not implemented yet')"]
+    restart: unless-stopped
+    expose: ["4001"]
+    # volumes:
+    #   - /var/run/docker.sock:/var/run/docker.sock   # orchestrator ONLY, never `app`
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: appuser
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+      POSTGRES_DB: cloudbrowser
+    volumes:
+      - pgdata:/var/lib/postgresql/data   # put this on encrypted storage in production
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+
+  proxy:
+    # Reverse-proxy placeholder: Caddy (automatic HTTPS) or Nginx + Let's Encrypt.
+    image: caddy:2-alpine
+    ports: ["80:80", "443:443"]
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on: [app]
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  caddy_data:
+  caddy_config:
+  # Browser profile volumes are created per-profile by the orchestrator
+  # (directory mode 0700, owned by the container user only).

@@ -1,0 +1,4 @@
+# Placeholder — replace with the real domain before production use.
+example.com {
+	reverse_proxy app:3000
+}
